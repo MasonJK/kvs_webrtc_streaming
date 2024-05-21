@@ -21,19 +21,13 @@ find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 
-add_library(
-  NvEncoderCuda SHARED
-  third_party/video-sdk-samples/Samples/NvCodec/NvEncoder/NvEncoderCuda.cpp
-  third_party/video-sdk-samples/Samples/NvCodec/NvEncoder/NvEncoder.cpp)
-target_include_directories(NvEncoderCuda
-                           PUBLIC third_party/video-sdk-samples/Samples
-                                  third_party/video-sdk-samples/Samples/NvCodec
-                                  /usr/local/cuda/include)
-target_link_libraries(NvEncoderCuda PUBLIC cuda)
-set_target_properties(
-  NvEncoderCuda
-  PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
-             $<TARGET_PROPERTY:NvEncoderCuda,INTERFACE_INCLUDE_DIRECTORIES>)
+
+# Find x264 library
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(X264 REQUIRED x264)
+include_directories(${X264_INCLUDE_DIRS})
+link_directories(${X264_LIBRARY_DIRS})
+add_definitions(${X264_CFLAGS_OTHER})
 
 add_library(
   amazon-kinesis-video-streams-webrtc-sdk-c-samples SHARED
@@ -70,11 +64,11 @@ ament_target_dependencies(${PROJECT_NAME}_node
                           "rclcpp"
                           "sensor_msgs")
 target_compile_options(${PROJECT_NAME}_node PRIVATE ${COMPILER_OPTIONS})
-target_include_directories(${PROJECT_NAME}_node PRIVATE /usr/local/cuda/include)
+target_include_directories(${PROJECT_NAME}_node PRIVATE ${X264_INCLUDE_DIRS})
 target_link_libraries(${PROJECT_NAME}_node
                       dl
-                      NvEncoderCuda
-                      amazon-kinesis-video-streams-webrtc-sdk-c-samples)
+                      amazon-kinesis-video-streams-webrtc-sdk-c-samples
+                      ${X264_LIBRARIES})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -84,7 +78,7 @@ endif()
 ament_package()
 
 install(TARGETS ${PROJECT_NAME}_node DESTINATION lib/${PROJECT_NAME})
-install(TARGETS NvEncoderCuda amazon-kinesis-video-streams-webrtc-sdk-c-samples
+install(TARGETS amazon-kinesis-video-streams-webrtc-sdk-c-samples
         LIBRARY DESTINATION lib)
 
 file(

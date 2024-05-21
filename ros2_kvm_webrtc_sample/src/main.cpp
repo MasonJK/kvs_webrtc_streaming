@@ -3,20 +3,18 @@
 #include <iostream>
 #include <queue>
 #include <string_view>
-
-#include <NvCodec/NvEncoder/NvEncoderCuda.h>
 #include <Samples.h>
-#include <Utils/Logger.h>
-#include <Utils/NvCodecUtils.h>
-#include <Utils/NvEncoderCLIOptions.h>
-#include <cuda.h>
+extern "C" {
+#include <x264.h>
+}
+
 
 #include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
-simplelogger::Logger* logger =
-    simplelogger::LoggerFactory::CreateConsoleLogger();
+// simplelogger::Logger* logger =
+//     simplelogger::LoggerFactory::CreateConsoleLogger();
 extern PSampleConfiguration gSampleConfiguration;
 
 struct EncodedFrame {
@@ -382,142 +380,135 @@ class KVSClient {
 
 KVSClient* KVSClient::instance = nullptr;
 
-class CudaEncoder {
- public:
-  void Init() {
-    int iGpu = 0;
-    ck(cuInit(0));
-    int nGpu = 0;
-    ck(cuDeviceGetCount(&nGpu));
-    if (iGpu < 0 || iGpu >= nGpu) {
-      std::cout << "GPU ordinal out of range. Should be within [" << 0 << ", "
-                << nGpu - 1 << "]" << std::endl;
-      exit(EXIT_FAILURE);
-    }
-    CUdevice cuDevice = 0;
-    ck(cuDeviceGet(&cuDevice, iGpu));
-    char szDeviceName[80];
-    ck(cuDeviceGetName(szDeviceName, sizeof(szDeviceName), cuDevice));
-    std::cout << "GPU in use: " << szDeviceName << std::endl;
-    ck(cuCtxCreate(&cuContext, 0, cuDevice));
-  }
-  void InitEncoder(int nWidth, int nHeight, NV_ENC_BUFFER_FORMAT eFormat) {
-    NvEncoderInitParam encodeCLIOptions = NvEncoderInitParam("");
-    enc = std::make_unique<NvEncoderCuda>(cuContext, nWidth, nHeight, eFormat);
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
-    NV_ENC_INITIALIZE_PARAMS initializeParams = {NV_ENC_INITIALIZE_PARAMS_VER};
-    NV_ENC_CONFIG encodeConfig = {NV_ENC_CONFIG_VER};
-#pragma GCC diagnostic pop
-    initializeParams.encodeConfig = &encodeConfig;
-    enc->CreateDefaultEncoderParams(&initializeParams,
-                                    encodeCLIOptions.GetEncodeGUID(),
-                                    encodeCLIOptions.GetPresetGUID());
-    // send IDR periodically
-    initializeParams.encodeConfig->gopLength = 60;
-    initializeParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = 60;
-    initializeParams.encodeConfig->encodeCodecConfig.h264Config.repeatSPSPPS =
-        1;
-    encodeCLIOptions.SetInitParams(&initializeParams, eFormat);
-    // std::cout << NvEncoderInitParam().FullParamToString(&initializeParams);
-    enc->CreateEncoder(&initializeParams);
 
-    int nFrameSize = enc->GetFrameSize();
-    pHostFrame.resize(nFrameSize);
-  }
-  EncodedFrame Encode(int nWidth, int nHeight,
-                      const std::vector<uint8_t>& image) {
-    if (!enc) {
-      InitEncoder(nWidth, nHeight, NV_ENC_BUFFER_FORMAT_ARGB);
-    }
-    int nFrameSize = enc->GetFrameSize();
-    const uint8_t* rgb = image.data();
-    uint8_t* argb = pHostFrame.data();
-    for (int i = 0; i < nFrameSize / 4; ++i) {
-      argb[0] = rgb[2];
-      argb[1] = rgb[1];
-      argb[2] = rgb[0];
-      rgb += 3;
-      argb += 4;
-    }
-    EncodedFrame encoded_frame;
-    encoded_frame.width = nWidth;
-    encoded_frame.height = nHeight;
-    const NvEncInputFrame* encoderInputFrame = enc->GetNextInputFrame();
-    NvEncoderCuda::CopyToDeviceFrame(
-        cuContext, pHostFrame.data(), 0,
-        (CUdeviceptr)encoderInputFrame->inputPtr, (int)encoderInputFrame->pitch,
-        enc->GetEncodeWidth(), enc->GetEncodeHeight(), CU_MEMORYTYPE_HOST,
-        encoderInputFrame->bufferFormat, encoderInputFrame->chromaOffsets,
-        encoderInputFrame->numChromaPlanes);
-    enc->EncodeFrame(encoded_frame.packets);
-    return encoded_frame;
-  }
+class x264Encoder {
+public:
+    void Init(int nWidth = 1920, int nHeight = 1080, int fps = 30) {
+        width = nWidth;
+        height = nHeight;
 
- private:
-  CUcontext cuContext = NULL;
-  std::unique_ptr<NvEncoderCuda> enc;
-  std::vector<uint8_t> pHostFrame;
+        // Set default parameters
+        x264_param_default_preset(&param, "veryfast", "zerolatency");
+
+        // Modify parameters as needed
+        param.i_bitdepth = 8;
+        param.i_width = nWidth;
+        param.i_height = nHeight;
+        param.i_fps_num = fps;
+        param.i_fps_den = 1;
+        param.i_keyint_max = fps;
+        param.b_intra_refresh = 1;
+        param.rc.i_rc_method = X264_RC_CRF;
+        param.rc.f_rf_constant = 25;
+        param.rc.f_rf_constant_max = 35;
+        param.i_sps_id = 7;
+        param.b_repeat_headers = 1;
+        param.i_log_level = X264_LOG_INFO;
+
+        // Apply profile
+        if (x264_param_apply_profile(&param, "high") < 0) {
+            std::cerr << "Failed to apply x264 profile" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        // Open encoder
+        encoder = x264_encoder_open(&param);
+        if (!encoder) {
+            std::cerr << "Failed to open x264 encoder" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        // Allocate image buffer
+        x264_picture_alloc(&pic_in, param.i_csp, param.i_width, param.i_height);
+    }
+
+    EncodedFrame Encode(int nWidth, int nHeight, const std::vector<uint8_t>& image) {
+        width = nWidth;
+        height = nHeight;
+        // printf("width : %f, height : %f", width, height)
+
+        // Convert RGB to YUV420
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int index = y * width + x;
+                int r = image[3 * index + 0];
+                int g = image[3 * index + 1];
+                int b = image[3 * index + 2];
+
+                pic_in.img.plane[0][y * pic_in.img.i_stride[0] + x] = (uint8_t)(0.257 * r + 0.504 * g + 0.098 * b + 16);
+                if (x % 2 == 0 && y % 2 == 0) {
+                    pic_in.img.plane[1][(y / 2) * pic_in.img.i_stride[1] + (x / 2)] = (uint8_t)(-0.148 * r - 0.291 * g + 0.439 * b + 128);
+                    pic_in.img.plane[2][(y / 2) * pic_in.img.i_stride[2] + (x / 2)] = (uint8_t)(0.439 * r - 0.368 * g - 0.071 * b + 128);
+                }
+            }
+        }
+
+        x264_nal_t* nals;
+        int i_nal;
+        x264_picture_t pic_out;
+        int frame_size = x264_encoder_encode(encoder, &nals, &i_nal, &pic_in, &pic_out);
+
+        EncodedFrame encoded_frame;
+        encoded_frame.width = width;
+        encoded_frame.height = height;
+
+        if (frame_size > 0) {
+            for (int i = 0; i < i_nal; i++) {
+                std::vector<uint8_t> packet(nals[i].p_payload, nals[i].p_payload + nals[i].i_payload);
+                encoded_frame.packets.push_back(packet);
+            }
+        }
+
+        return encoded_frame;
+    }
+
+    ~x264Encoder() {
+        x264_picture_clean(&pic_in);
+        if (encoder) {
+            x264_encoder_close(encoder);
+        }
+    }
+
+private:
+    x264_param_t param;
+    x264_t* encoder = nullptr;
+    x264_picture_t pic_in;
+    int width;
+    int height;
 };
 
+
 class ROS2KVSWebRtcProxy : public rclcpp::Node {
- public:
-  ROS2KVSWebRtcProxy(KVSClient& kvs_client,
-                     const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
-      : ROS2KVSWebRtcProxy(kvs_client, "", options) {}
-  ROS2KVSWebRtcProxy(KVSClient& kvs_client, const std::string& name_space,
-                     const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
-      : Node("ros2_kvs_webrtc_proxy", name_space, options),
-        kvs_client_{kvs_client} {
-    subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
-        "image_raw", rclcpp::QoS(10),
-        std::bind(&ROS2KVSWebRtcProxy::ImageCallback, this,
-                  std::placeholders::_1));
-    publisher_ =
-        this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
-    kvs_client_.RegisterDataChannelMessageCallback(
-        std::bind(&ROS2KVSWebRtcProxy::DataChannelMessageCallback, this,
-                  std::placeholders::_1));
-    encoder_.Init();
-  }
+public:
+    ROS2KVSWebRtcProxy(KVSClient& kvs_client,
+                       const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
+        : ROS2KVSWebRtcProxy(kvs_client, "", options) {}
 
-  void ImageCallback(const sensor_msgs::msg::Image::SharedPtr msg) {
-    if (!kvs_client_.isReady()) {
-      return;
+    ROS2KVSWebRtcProxy(KVSClient& kvs_client, const std::string& name_space,
+                       const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
+        : Node("ros2_kvs_webrtc_proxy", name_space, options),
+          kvs_client_{kvs_client} {
+        subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
+            "/camera/image_raw", rclcpp::QoS(10),
+            std::bind(&ROS2KVSWebRtcProxy::ImageCallback, this,
+                      std::placeholders::_1));
+        encoder_.Init();
     }
-    EncodedFrame encoded_frame =
-        encoder_.Encode(msg->width, msg->height, msg->data);
-    kvs_client_.QueueEncodedFrame(std::move(encoded_frame));
-  }
-  void DataChannelMessageCallback(std::string_view msg) {
-    auto message = geometry_msgs::msg::Twist();
-    double x = 0;
-    double y = 0;
-    double z = 0;
-    double pitch = 0;
-    double yaw = 0;
-    int ret =
-        std::sscanf(msg.data(), "{\"x\":%lf,\"y\":%lf,\"z\":%lf,\"yaw\":%lf}",
-                    &x, &y, &z, &yaw);
-    if (ret == 0) {
-      std::cerr << "Failed to parse:" << msg << std::endl;
-      return;
-    }
-    message.linear.x = x;
-    message.linear.y = y;
-    message.linear.z = z;
-    message.angular.y = pitch;
-    message.angular.z = yaw;
-    RCLCPP_DEBUG(this->get_logger(), "command: linear.x=%f, angular.z=%f",
-                 message.linear.x, message.angular.z);
-    publisher_->publish(message);
-  }
 
- private:
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscription_;
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr publisher_;
-  CudaEncoder encoder_;
-  KVSClient& kvs_client_;
+    void ImageCallback(const sensor_msgs::msg::Image::SharedPtr msg) {
+      if (!kvs_client_.isReady()) {
+        return;
+      }
+      std::cout<<"width : "<<msg->width<<", height : "<<msg->height<<std::endl;
+      EncodedFrame encoded_frame = encoder_.Encode(msg->width, msg->height, msg->data);
+      kvs_client_.QueueEncodedFrame(std::move(encoded_frame));
+    }
+
+private:
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscription_;
+    x264Encoder encoder_;  // Use the x264Encoder instead of CudaEncoder
+    KVSClient& kvs_client_;
+    bool encoder_initialized_ = false;
 };
 
 int main(int argc, char* argv[]) {
